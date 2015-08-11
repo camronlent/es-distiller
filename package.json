@@ -15,5 +15,8 @@
   "bugs": {
     "url": "https://github.com/camronlent/es-distiller/issues"
   },
-  "homepage": "https://github.com/camronlent/es-distiller#readme"
+  "homepage": "https://github.com/camronlent/es-distiller#readme",
+  "devDependencies": {
+    "mocha": "^2.2.5"
+  }
 }
