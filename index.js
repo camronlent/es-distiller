@@ -6,6 +6,7 @@ util.inherits(Distillery, PassThrough);
 util.inherits(Distiller, Transform);
 util.inherits(Condenser, Transform);
 util.inherits(Parser, Transform);
+util.inherits(Formatter, Transform);
 
 module.exports = Distillery;
 
@@ -25,7 +26,9 @@ function Distillery (options)
 	var _this = this;
 	this._distillChain = undefined;
 
-	// TODO: Find out the right place to specify this.
+	// TODO: Research object mode and non-object mode.
+	// TODO: Evaluate for correctness of object vs non-object mode.
+
 	// Enforce default mode to objectMode
 	options.objectMode = options.objectMode || true;
 
@@ -35,7 +38,7 @@ function Distillery (options)
 		// TODO: Research why this is necessary, I don't fully understand it yet.
 		source.unpipe(this);
 
-		// TODO: Research best error propogation, I susspect that re-emission isn't the right answer.
+		// TODO: Research best error propagation, I suspect that re-emission isn't the right answer.
 		this._distillChain = source
 			.pipe(new Distiller(options))
 			.on("error", function (error)
@@ -46,7 +49,8 @@ function Distillery (options)
 			.on("error", function (error)
 			{
 				_this.emit("error", error);
-			});
+			})
+			.pipe(new Formatter(options));
 	});
 
 	PassThrough.call(this, options);
@@ -117,7 +121,7 @@ function Condenser (options)
 	this.isOpen = false;
 	this.isClosed = false;
 	this.contents = [];
-	this.queue = [];
+	this.queue = {};
 
 	var _this = this;
 	this.parser = new Parser(options);
@@ -145,8 +149,9 @@ function Condenser (options)
 Condenser.prototype._transform = function (data, encoding, done)
 {
 	// TODO: Research the possibility of data.toString() failing because of "half-characters"
+
 	// NOTE: Object Mode forces stream to UTF-8. I assume that means that it won't ever be given a chunk
-	// that does not contain all of the bytes necessary to represent a character. But I also susspect that
+	// that does not contain all of the bytes necessary to represent a utf-8 character. But I also suspect that
 	// assumption doesn't make sense.
 	var str = data.toString();
 
@@ -163,7 +168,7 @@ Condenser.prototype._transform = function (data, encoding, done)
 			// not in a marked area.
 			if (this.isOpen === false)
 			{
-				tokenSearch.call(this, str[i], tokenOpen, tokenEscape,
+				tokenSearch.call(this, "begin-1", str[i], tokenOpen, tokenEscape,
 					// when the token has been seen twice
 					function ()
 					{
@@ -179,25 +184,28 @@ Condenser.prototype._transform = function (data, encoding, done)
 			// in an open marked area.
 			else if (this.isOpen === true)
 			{
-				tokenSearch.call(this, str[i], tokenClose, tokenEscape,
-					// when the token has been seen twice
+				tokenSearch.call(this, "begin-2", str[i], tokenOpen, tokenEscape,
 					function ()
 					{
-						this.isOpen = false;
-						this.parser.finalize();
+						// if we find a beginning tag that's not escaped, the distiller step before has failed.
+						throw new CondenserException("es-distiller: distiller failed.");
 					},
-					// when the token has not been seen twice yet.
 					function (char)
 					{
-						// Note: this is actually unnecessary, but without it people don't get errors... which leads
-						// to templates silently failing...
-						if (char === tokenOpen || char === tokenClose)
-						{
-							throw new CondenserException("es-distiller: condenser failed.");
-						}
-						this.parser.write(char);
-					}
-				);
+						tokenSearch.call(this, "end", char, tokenClose, tokenEscape,
+							// when the token has been seen twice
+							function ()
+							{
+								this.isOpen = false;
+								this.parser.finalize();
+							},
+							// when the token has not been seen twice yet.
+							function (char)
+							{
+								this.parser.write(char);
+							}
+						);
+					});
 			}
 		}
 
@@ -225,10 +233,19 @@ Condenser.prototype._flush = function (done)
 	}
 	else
 	{
+		// NOTE: This shouldn't happen unless the last character is a '{' or '}'
+
+		// TODO: Evaluate if this is actually the right place to do this
+		// TODO: Evaluate if this is the right "thing" to do.
+
 		// Push any "unfinished business" into the buffer
-		if (this.queue.length === 1)
+		var keys = Object.keys(this.queue);
+		for (var i = 0; i < keys.length; i++)
 		{
-			this.push(this.queue.shift());
+			if (this.queue[keys[i]].length === 1)
+			{
+				this.push(this.queue[keys[i]].shift());
+			}
 		}
 		done();
 	}
@@ -352,12 +369,61 @@ Parser.prototype.finalize = function ()
 };
 
 /**
+ * Transform stream to un-escape tokens
+ * @param options
+ * @constructor
+ */
+function Formatter (options)
+{
+	this.queue = [];
+	Transform.call(this, options);
+}
+
+Formatter.prototype._transform = function (data, encoding, done)
+{
+	var i, scope,
+		str    = data.toString(),
+		tokenA = "\\{",
+		tokenB = "\\}";
+
+	for (i = 0; i < str.length; i++)
+	{
+		this.queue.push(str[i]);
+		if (this.queue.length === 2)
+		{
+			scope = this.queue.join("");
+			switch (scope)
+			{
+				case tokenA:
+				case tokenB:
+					this.push(this.queue.pop());
+					this.queue.pop();
+					break;
+				default:
+					this.push(this.queue.shift());
+					break;
+			}
+		}
+	}
+	done();
+};
+
+Formatter.prototype._flush = function (done)
+{
+	if (this.queue.length > 0)
+	{
+		this.push(this.queue.shift());
+	}
+	done();
+};
+
+/**
  * Check if a character is a whitespace character or not
  * @param char The character to test for whitespace
  * NOTE: this function may change beyond a regular regex as this
  * code becomes more used.
  */
-function isWhiteSpace(char)
+function isWhiteSpace (char)
 {
 	return /\s/.test(char);
 }
@@ -366,41 +432,47 @@ function isWhiteSpace(char)
  * Abstraction to looking for the token twice, taking into account escaped tokens.
  * @this Parser The parser responsible for searching for the token.
  * @param cur The current character
+ * @param key The key to store back-references under
  * @param token The token we're looking for twice
  * @param escape The character to escape the token
  * @param cbActivate The callback if the token was found twice
  * @param cbAction The callback to handle the given character until token found
  */
-function tokenSearch (cur, token, escape, cbActivate, cbAction)
+function tokenSearch (key, cur, token, escape, cbActivate, cbAction)
 {
-	if (cur === token || cur === escape)
+	// TODO: Re-evaluate this function for efficiency after factoring out un-escaping
+
+	if (!(key in this.queue))
 	{
-		this.queue.push(cur);
+		this.queue[key] = [];
 	}
 
-	if (this.queue.length == 2)
+	if (cur === token || cur === escape)
 	{
-		switch (this.queue.join(""))
+		this.queue[key].push(cur);
+	}
+
+	if (this.queue[key].length == 2)
+	{
+		switch (this.queue[key].join(""))
 		{
 			case token + token:
 				cbActivate.call(this);
-				this.queue.splice(0, 2);
-				break;
-			case escape + token:
-				cbAction.call(this, token);
-				this.queue.splice(0, 2);
+				this.queue[key].splice(0, 2);
 				break;
 			case token + escape:
 			case escape + escape:
-				cbAction.call(this, this.queue.shift());
+			case escape + token:
+				cbAction.call(this, this.queue[key].shift());
+				cbAction.call(this, this.queue[key].shift());
 				break;
 		}
 	}
 	else if (cur !== token && cur !== escape)
 	{
-		if (this.queue.length === 1)
+		if (this.queue[key].length === 1)
 		{
-			cbAction.call(this, this.queue.shift());
+			cbAction.call(this, this.queue[key].shift());
 		}
 		cbAction.call(this, cur);
 	}
@@ -526,19 +598,19 @@ function evaluate (expr)
 		for (k = 0; k < keys[i].length; k++)
 		{
 			if ((
-				keys[i][k] === "."
-				|| (!!quote && keys[i][k] === quote)
-				|| (!quote && (keys[i][k] === "\"" || keys[i][k] === "'"))
-			) && c === "\\"
-			|| (keys[i][k] !== "\\" && c !== "\\"))
+					keys[i][k] === "."
+					|| (!!quote && keys[i][k] === quote)
+					|| (!quote && (keys[i][k] === "\"" || keys[i][k] === "'"))
+				) && c === "\\"
+				|| (keys[i][k] !== "\\" && c !== "\\"))
 			{
 				tmpKey.push(keys[i][k]);
 			}
-			else if(keys[i][k] === "\\" && c === "\\")
+			else if (keys[i][k] === "\\" && c === "\\")
 			{
 				tmpKey.push(c);
 			}
-			else if(c === "\\")
+			else if (c === "\\")
 			{
 				tmpKey.push(c);
 				tmpKey.push(keys[i][k]);
