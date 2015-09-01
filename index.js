@@ -1,3 +1,5 @@
+"use strict";
+
 var PassThrough = require("stream").PassThrough,
 	util = require("util"),
 	Distiller = require("./lib/distiller.js"),
